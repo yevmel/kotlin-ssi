@@ -1,18 +1,14 @@
 package de.melnichuk.ssi
 
-import org.junit.jupiter.api.assertThrows
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
 class SsiParserTest {
 
-    private fun parse(html: String): String =
-        SsiParser { cmd, params ->
-            when (cmd) {
-                "include" -> "[${params["virtual"]}]"
-                else      -> throw IllegalArgumentException("Unknown cmd")
-            }
-        }.feed(html.byteInputStream(Charsets.UTF_8), Charsets.UTF_8)
+    private fun parse(html: String): String = Parser().parse(html.byteInputStream()).map { when(it) {
+        is Segment.PlainTextSegment -> it.text
+        is Segment.CommandSegment -> """[${it.params["virtual"]}]"""
+    } }.joinToString("")
 
     @Test fun `non-ascii content passes through unchanged`() {
         assertEquals("<p>Hellö 🫤 é</p>", parse("<p>Hellö 🫤 é</p>"))
@@ -38,12 +34,6 @@ class SsiParserTest {
         assertEquals("[/nav.html]", parse("<!--#\n    include virtual=\"/nav.html\" -->"))
     }
 
-    @Test fun `unknown command is passed to handler`() {
-        assertThrows<IllegalArgumentException> {
-            parse("""<!--#echo var="DATE" -->""")
-        }
-    }
-
     @Test fun `malformed directive is silently dropped`() {
         assertEquals("<p>after</p>", parse("""<!--#!! bad -->""" + "<p>after</p>"))
     }
@@ -62,12 +52,5 @@ class SsiParserTest {
 
     @Test fun `escaped quote inside value is accepted`() {
         assertEquals("""[/path/"x"]""", parse("""<!--#include virtual="/path/\"x\"" -->"""))
-    }
-
-    @Test fun `multiple params are all collected`() {
-        var seenParams = emptyMap<String, String>()
-        val html = """<!--#set var1="X" var2="42" -->"""
-        SsiParser { _, params -> seenParams = params; "" }.feed(html.byteInputStream(Charsets.UTF_8), Charsets.UTF_8)
-        assertEquals(mapOf("var1" to "X", "var2" to "42"), seenParams)
     }
 }

@@ -13,77 +13,111 @@ private sealed class State {
     // matching "<!--#"
     data class Tag(val matched: Int) : State()
 
+        // matching closing "-->"
+    data class CommentEnd(
+        val matched: Int,
+        val cmd: String,
+        val params: Map<String, String> = emptyMap()
+    ) : State()
+
     object PreCommand : State()
     data class Command   (val name: String) : State()
-    data class PreParam  (val cmd: String, val params: Map<String, String>) : State()
+    data class PreParam  (val cmd: String, val params: Map<String, String> = emptyMap()) : State()
     data class Param     (val cmd: String, val params: Map<String, String>, val paramName: String) : State()
     data class PreEqual  (val cmd: String, val params: Map<String, String>, val paramName: String) : State()
     data class PreValue  (val cmd: String, val params: Map<String, String>, val paramName: String) : State()
 
-    data class QuotedValue(val cmd: String, val params: Map<String, String>,
-                           val paramName: String, val value: String, val quote: Char) : State()
-    data class QuoteEscape(val cmd: String, val params: Map<String, String>,
-                           val paramName: String, val value: String, val quote: Char) : State()
+    data class QuotedValue(
+        val cmd: String,
+        val params: Map<String, String>,
+        val paramName: String,
+        val value: String,
+        val quote: Char
+    ) : State()
 
-    // matching closing "-->"
-    data class CommentEnd(val matched: Int, val cmd: String, val params: Map<String, String>) : State()
+    data class QuoteEscape(
+        val cmd: String,
+        val params: Map<String, String>,
+        val paramName: String,
+        val value: String,
+        val quote: Char
+    ) : State()
 
     object Error : State()
     data class ErrorEnd(val matched: Int) : State()
 }
 
-private val SSI_PREFIX = "<!--#"
-private val SSI_SUFFIX = "-->"
+sealed class Segment {
+    data class PlainTextSegment(
+        val text: String,
+    ): Segment()
 
-class SsiParser(
-    private val handler: (cmd: String, params: Map<String, String>) -> String)
-{
-    private var state: State = State.Html
+    data class CommandSegment(
+        val command: String,
+        val params: Map<String, String> = emptyMap()
+    ): Segment()
+}
 
-    private val output  = StringBuilder()
-    private val pending = StringBuilder() // buffers "<!--#" prefix until confirmed or rejected
+private const val SSI_PREFIX = "<!--#"
+private const val SSI_SUFFIX = "-->"
 
-    fun feed(input: InputStream, charset: Charset): String {
-        val reader = InputStreamReader(input, charset)
+class Parser {
+    private val output = StringBuilder()
+    private val pending = StringBuilder()
+
+    private val segments = mutableListOf<Segment>()
+
+    fun parse(
+        inputStream: InputStream,
+        charset: Charset = Charsets.UTF_8
+    ): List<Segment> {
+        var state: State = State.Html
+        val reader = InputStreamReader(inputStream, charset)
 
         while (true) {
-            val cp = reader.read()
-            if (cp == -1) {
+            val char = reader.read()
+            if (char == -1) {
                 break
             }
 
-            state = step(state, cp.toChar())
+           state = step(state, char.toChar())
         }
 
-        output.append(pending) // unclosed tag prefix at end of input → pass through as-is
-        pending.clear()
-
-        try {
-            return output.toString()
-        } finally {
+        if (output.isNotEmpty()) {
+            segments += Segment.PlainTextSegment(output.toString())
             output.clear()
         }
+
+        if (pending.isNotEmpty()) {
+            segments += Segment.PlainTextSegment(pending.toString())
+            pending.clear()
+        }
+
+        return segments
     }
 
-    private fun step(s: State, c: Char): State = when (s) {
-        State.Html -> if (c == '<') {
+    private fun step(state: State, char: Char): State = when (state) {
+        is State.Html -> if (char == '<') {
             pending.append('<')
             State.Tag(matched = 1)
         } else {
-            output.append(c)
+            output.append(char)
             State.Html
         }
 
         is State.Tag -> {
-            val expected = SSI_PREFIX[s.matched]
-            when (c) {
+            val expected = SSI_PREFIX[state.matched]
+
+            when (char) {
                 expected -> {
-                    val next = s.matched + 1
-                    if (next == SSI_PREFIX.length) {
-                        pending.clear() // "<!--#" found
+                    val next = state.matched + 1
+                    if (next == SSI_PREFIX.length) { // "<!--#" found
+                        pending.clear()
+                        segments.add(Segment.PlainTextSegment(output.toString()))
+                        output.clear()
                         State.PreCommand
-                    } else {
-                        pending.append(c)
+                    } else { // still parsing "<!--#"
+                        pending.append(char)
                         State.Tag(next)
                     }
                 }
@@ -98,78 +132,92 @@ class SsiParser(
                 else -> {
                     output.append(pending)
                     pending.clear()
-                    output.append(c)
+                    output.append(char)
                     State.Html
                 }
             }
         }
 
-        State.PreCommand -> when {
-            c.isLetter()        -> State.Command(c.toString())
-            c.isWhitespace() -> State.PreCommand
-            else                -> State.Error
+        is State.PreCommand -> when {
+            char.isLetter() -> State.Command(char.toString())
+            char.isWhitespace() -> State.PreCommand
+            else -> State.Error
         }
 
         is State.Command -> when {
-            c.isParamChar()     -> State.Command(s.name + c)
-            c.isWhitespace() -> State.PreParam(s.name, emptyMap())
-            c == '-'            -> State.CommentEnd(1, s.name, emptyMap())
-            else                -> State.Error
+            char.isParamChar() -> State.Command(state.name + char)
+            char.isWhitespace() -> State.PreParam(state.name)
+            char == '-' -> State.CommentEnd(1, state.name)
+            else -> State.Error
         }
 
         is State.PreParam -> when {
-            c.isLetter()        -> State.Param(s.cmd, s.params, c.toString())
-            c.isWhitespace() -> s
-            c == '-'            -> State.CommentEnd(1, s.cmd, s.params)
-            else                -> State.Error
+            char.isLetter() -> State.Param(state.cmd, state.params, char.toString())
+            char.isWhitespace() -> state
+            char == '-' -> State.CommentEnd(1, state.cmd, state.params)
+            else -> State.Error
         }
 
         is State.Param -> when {
-            c.isParamChar()     -> State.Param(s.cmd, s.params, s.paramName + c)
-            c.isWhitespace() -> State.PreEqual(s.cmd, s.params, s.paramName)
-            c == '='            -> State.PreValue(s.cmd, s.params, s.paramName)
-            else                -> State.Error
+            char.isParamChar() -> State.Param(state.cmd, state.params, state.paramName + char)
+            char.isWhitespace() -> State.PreEqual(state.cmd, state.params, state.paramName)
+            char == '=' -> State.PreValue(state.cmd, state.params, state.paramName)
+            else -> State.Error
         }
 
-        is State.PreEqual -> when (c) {
-            '='        -> State.PreValue(s.cmd, s.params, s.paramName)
-            ' ', '\t'  -> s
-            else       -> State.Error
+        is State.PreEqual -> when (char) {
+            '=' -> State.PreValue(state.cmd, state.params, state.paramName)
+            ' ', '\t' -> state
+            else -> State.Error
         }
 
-        is State.PreValue -> when (c) {
-            '"', '\'' -> State.QuotedValue(s.cmd, s.params, s.paramName, value = "", quote = c)
-            ' ', '\t' -> s
-            else      -> State.Error
+        is State.PreValue -> when (char) {
+            '"', '\'' -> State.QuotedValue(state.cmd, state.params, state.paramName, value = "", quote = char)
+            ' ', '\t' -> state
+            else -> State.Error
         }
 
-        is State.QuotedValue -> when {
-            c == s.quote -> State.PreParam(s.cmd, s.params + (s.paramName to s.value))
-            c == '\\'    -> State.QuoteEscape(s.cmd, s.params, s.paramName, s.value, s.quote)
-            else         -> State.QuotedValue(s.cmd, s.params, s.paramName, s.value + c, s.quote)
+        is State.QuotedValue -> when (char) {
+            state.quote -> State.PreParam(state.cmd, state.params + (state.paramName to state.value))
+            '\\' -> State.QuoteEscape(state.cmd, state.params, state.paramName, state.value, state.quote)
+            else -> State.QuotedValue(state.cmd, state.params, state.paramName, state.value + char, state.quote)
         }
 
-        is State.QuoteEscape -> State.QuotedValue(s.cmd, s.params, s.paramName, s.value + c, s.quote)
+        is State.QuoteEscape -> State.QuotedValue(state.cmd, state.params, state.paramName, state.value + char, state.quote)
 
         is State.CommentEnd -> {
-            if (c == SSI_SUFFIX[s.matched]) {
-                val next = s.matched + 1
-                if (next == SSI_SUFFIX.length) {
-                    output.append(handler(s.cmd, s.params))
-                    State.Html
-                } else {
-                    State.CommentEnd(next, s.cmd, s.params)
+            when (char) {
+                SSI_SUFFIX[state.matched] -> {
+                    when (val next = state.matched + 1) {
+                        SSI_SUFFIX.length -> {
+                            segments += Segment.CommandSegment(state.cmd, state.params)
+                            State.Html
+                        }
+
+                        else -> State.CommentEnd(next, state.cmd, state.params)
+                    }
                 }
-            } else State.Error
+
+                else -> State.Error
+            }
         }
 
-        State.Error -> if (c == SSI_SUFFIX[0]) State.ErrorEnd(1) else State.Error
+        State.Error -> when (char) {
+            SSI_SUFFIX[0] -> State.ErrorEnd(1)
+            else -> State.Error
+        }
 
         is State.ErrorEnd -> {
-            if (c == SSI_SUFFIX[s.matched]) {
-                val next = s.matched + 1
-                if (next == SSI_SUFFIX.length) State.Html else State.ErrorEnd(next)
-            } else State.Error
+            when (char) {
+                SSI_SUFFIX[state.matched] -> {
+                    when (val next = state.matched + 1) {
+                        SSI_SUFFIX.length -> State.Html
+                        else -> State.ErrorEnd(next)
+                    }
+                }
+
+                else -> State.Error
+            }
         }
     }
 }
